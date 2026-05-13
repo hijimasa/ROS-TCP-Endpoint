@@ -22,6 +22,7 @@ import importlib
 from rclpy.node import Node
 from rclpy.parameter import Parameter
 from rclpy.executors import MultiThreadedExecutor
+from rclpy.exceptions import InvalidHandle
 from rclpy.serialization import deserialize_message
 
 from .tcp_sender import UnityTcpSender
@@ -164,13 +165,26 @@ class TcpServer(Node):
             executor.add_node(ros_node)
 
         self.executor = executor
-        executor.spin()
+        while rclpy.ok():
+            try:
+                executor.spin()
+                break
+            except InvalidHandle as e:
+                # A subscriber/publisher/service node was destroyed (e.g. on
+                # Unity re-registration) while the executor was reading from
+                # its handle. rclpy Humble does not catch this in
+                # _take_subscription, so spin() exits. Resume spinning so
+                # message transport does not silently stop.
+                self.logwarn(
+                    "Executor caught InvalidHandle during spin "
+                    "(likely a node re-registration race); resuming: {}".format(e)
+                )
 
     def unregister_node(self, old_node):
         if old_node is not None:
-            old_node.unregister()
             if self.executor is not None:
                 self.executor.remove_node(old_node)
+            old_node.unregister()
 
     def destroy_nodes(self):
         """
