@@ -76,6 +76,11 @@ class TcpServer(Node):
         self.syscommands = SysCommands(self)
         self.pending_srv_id = None
         self.pending_srv_is_request = False
+        # start() spawns the listen thread before setup_executor() runs, so a
+        # client can connect and register a topic while this is still unset.
+        # Without the default, that raced into an AttributeError which killed
+        # the client thread (and with it every topic and service).
+        self.executor = None
 
     def start(self, publishers=None, subscribers=None):
         if publishers is not None:
@@ -119,13 +124,37 @@ class TcpServer(Node):
         self.unity_tcp_sender.send_unity_service_response(srv_id, data)
 
     def handle_syscommand(self, topic, data):
-        function = getattr(self.syscommands, topic[2:])
-        if function is None:
+        """
+        Dispatch a "__..." system command coming from the Unity side.
+
+        Nothing in here may raise. ClientThread.run() only catches IOError, so
+        any other exception escaping this call tears down the client thread in
+        its finally block; from Unity's point of view every topic and every
+        service goes silent at once. An unknown command or a malformed payload
+        must therefore be reported, not propagated.
+        """
+        command = topic[2:]
+
+        if command not in SysCommands.COMMANDS:
+            self.logerr("Unknown SysCommand '{}'".format(topic))
             self.send_unity_error("Don't understand SysCommand.'{}'".format(topic))
-        else:
+            return
+
+        function = getattr(self.syscommands, command, None)
+        if not callable(function):
+            self.logerr("SysCommand '{}' is declared but not implemented".format(topic))
+            self.send_unity_error("SysCommand.'{}' is not implemented".format(topic))
+            return
+
+        try:
             message_json = data.decode("utf-8")[:-1]
             params = json.loads(message_json)
             function(**params)
+        except Exception as e:
+            # Includes UnicodeDecodeError / JSONDecodeError for a corrupt
+            # payload and TypeError for arguments the command does not accept.
+            self.logerr("SysCommand '{}' failed: {}: {}".format(topic, type(e).__name__, e))
+            self.send_unity_error("SysCommand.'{}' failed: {}".format(topic, e))
 
     def loginfo(self, text):
         self.get_logger().info(text)
@@ -203,6 +232,26 @@ class TcpServer(Node):
 
 
 class SysCommands:
+    # The commands the Unity side may invoke, matching SysCommand.cs in
+    # ROS-TCP-Connector (minus the "__" prefix). Dispatch is driven by data off
+    # the socket, so it goes through this allow list rather than a bare getattr
+    # over every attribute of this class.
+    COMMANDS = frozenset(
+        {
+            "subscribe",
+            "publish",
+            "ros_service",
+            "unity_service",
+            "remove_subscriber",
+            "remove_publisher",
+            "remove_ros_service",
+            "remove_unity_service",
+            "response",
+            "request",
+            "topic_list",
+        }
+    )
+
     def __init__(self, tcp_server):
         self.tcp_server = tcp_server
 
@@ -319,6 +368,42 @@ class SysCommands:
             self.tcp_server.executor.add_node(new_service)
 
         self.tcp_server.loginfo("RegisterUnityService({}, {}) OK".format(topic, message_class))
+
+    def _remove(self, table, topic, kind):
+        """
+        Shared body of the four unregistration commands.
+
+        Tolerates a topic that is not registered: Unity may drop an object whose
+        registration never completed (or send the removal twice), and that is
+        not worth failing the call over.
+        """
+        if topic == "":
+            self.tcp_server.send_unity_error(
+                "Can't remove a blank topic name! SysCommand.remove_{}".format(kind)
+            )
+            return
+
+        old_node = table.pop(topic, None)
+        if old_node is None:
+            self.tcp_server.logwarn(
+                "Remove{}({}) - not registered, ignoring".format(kind, topic)
+            )
+            return
+
+        self.tcp_server.unregister_node(old_node)
+        self.tcp_server.loginfo("Remove{}({}) OK".format(kind, topic))
+
+    def remove_subscriber(self, topic):
+        self._remove(self.tcp_server.subscribers_table, topic, "Subscriber")
+
+    def remove_publisher(self, topic):
+        self._remove(self.tcp_server.publishers_table, topic, "Publisher")
+
+    def remove_ros_service(self, topic):
+        self._remove(self.tcp_server.ros_services_table, topic, "RosService")
+
+    def remove_unity_service(self, topic):
+        self._remove(self.tcp_server.unity_services_table, topic, "UnityService")
 
     def response(self, srv_id):  # the next message is a service response
         self.tcp_server.pending_srv_id = srv_id

@@ -14,13 +14,45 @@ The format is based on [Keep a Changelog](http://keepachangelog.com/en/1.0.0/) a
 
 Added Sonarqube scanner
 
+Implemented the four unregistration system commands the ROS-TCP-Connector already
+knew how to send but that had no handler here: `__remove_subscriber`,
+`__remove_publisher`, `__remove_ros_service` and `__remove_unity_service`. Each
+destroys the corresponding ROS node and drops it from its table; removing a topic
+that is not registered logs a warning instead of failing, so a duplicate or
+late removal is harmless. Without these, a Unity scene that despawns objects
+leaked a ROS node per topic for the lifetime of the endpoint, and the topics
+stayed visible in `ros2 topic list` long after their publisher was gone.
+Verified against Unity_ROS2_Robot_Simulator: spawning a robot registers its
+eight topics, despawning it removes all eight, and respawning brings them back.
+
 ### Changed
+
+`SysCommands` dispatch now goes through an explicit allow list (`SysCommands.COMMANDS`)
+rather than a bare `getattr` over every attribute of the class.
 
 ### Deprecated
 
 ### Removed
 
 ### Fixed
+
+An unknown or malformed system command no longer takes down the whole client
+connection. `handle_syscommand` used `getattr` without a default, so a command
+this endpoint did not implement raised `AttributeError`; `ClientThread.run` only
+catches `IOError`, so the exception reached its `finally` block and closed the
+socket. From Unity's side every topic and every service went silent at once.
+Unknown commands, undecodable payloads and wrong argument sets are now reported
+back to Unity and logged, and the connection stays up.
+
+`TcpServer.executor` is now initialised to `None` in the constructor. `start()`
+spawns the listen thread before `setup_executor()` assigns the attribute, so a
+client that connected in that window hit `AttributeError` and lost its
+connection thread.
+
+`default_server_endpoint.main` no longer exits with a traceback on Ctrl-C. The
+`rclpy` signal handler has already shut the context down by then, so the
+unconditional `rclpy.shutdown()` raised `RCLError: rcl_shutdown already called`;
+it now uses the idempotent `rclpy.try_shutdown()`.
 
 
 ## [0.7.0] - 2022-02-01
