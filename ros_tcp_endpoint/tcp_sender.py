@@ -24,6 +24,7 @@ from rclpy.serialization import serialize_message
 
 from .client import ClientThread
 from .thread_pauser import ThreadPauser
+from .unity_action import ActionGoalBridge
 
 # queue module was renamed between python 2 and 3
 try:
@@ -54,6 +55,11 @@ class UnityTcpSender:
         self.next_srv_id = 1001
         self.srv_lock = threading.Lock()
         self.services_waiting = {}
+
+        # in-flight action goals, keyed by the id we hand to Unity
+        self.next_action_id = 2001
+        self.action_lock = threading.Lock()
+        self.actions_waiting = {}
 
     def send_unity_info(self, text):
         if self.queue is not None:
@@ -119,6 +125,53 @@ class UnityTcpSender:
             del self.services_waiting[srv_id]
 
         thread_pauser.resume_with_result(data)
+
+    def send_unity_action_goal(self, topic, goal):
+        """
+        Forward a goal to Unity. Returns (action_id, bridge); the caller waits on
+        the bridge for feedback and the result.
+        """
+        if self.queue is None:
+            return None, None
+
+        bridge = ActionGoalBridge()
+        with self.action_lock:
+            action_id = self.next_action_id
+            self.next_action_id += 1
+            self.actions_waiting[action_id] = bridge
+
+        command = SysCommand_Action()
+        command.action_id = action_id
+        serialized_header = ClientThread.serialize_command("__action_goal", command)
+        serialized_message = ClientThread.serialize_message(topic, goal)
+        self.queue.put(b"".join([serialized_header, serialized_message]))
+        return action_id, bridge
+
+    def send_unity_action_cancel(self, topic, action_id):
+        if self.queue is None:
+            return
+        command = SysCommand_ActionCancel()
+        command.topic = topic
+        command.action_id = action_id
+        self.queue.put(ClientThread.serialize_command("__action_cancel", command))
+
+    def send_unity_action_feedback(self, action_id, message):
+        bridge = self._get_action(action_id)
+        if bridge is not None:
+            bridge.push_feedback(message)
+
+    def send_unity_action_result(self, action_id, result, status):
+        bridge = self._get_action(action_id)
+        if bridge is not None:
+            bridge.finish(result, status)
+
+    def forget_action(self, action_id):
+        with self.action_lock:
+            self.actions_waiting.pop(action_id, None)
+
+    def _get_action(self, action_id):
+        with self.action_lock:
+            return self.actions_waiting.get(action_id)
 
     def get_registered_topic(self, topic):
         if topic in self.tcp_server.publishers_table:
@@ -219,6 +272,17 @@ class SysCommand_Log:
 class SysCommand_Service:
     def __init__(self):
         srv_id = 0
+
+
+class SysCommand_Action:
+    def __init__(self):
+        self.action_id = 0
+
+
+class SysCommand_ActionCancel:
+    def __init__(self):
+        self.topic = ""
+        self.action_id = 0
 
 
 class SysCommand_TopicsResponse:

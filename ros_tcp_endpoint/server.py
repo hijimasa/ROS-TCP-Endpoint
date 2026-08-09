@@ -31,12 +31,18 @@ from .subscriber import RosSubscriber
 from .publisher import RosPublisher
 from .service import RosService
 from .unity_service import UnityService
+from .unity_action import UnityAction
 
 
 class TcpServer(Node):
     """
     Initializes ROS node and TCP server.
     """
+
+    # Lower bound on executor threads. One goal in flight needs a thread for its
+    # execute_callback and another for the cancel request that may arrive while it
+    # runs; the rest is headroom for services and topics registering later.
+    MIN_EXECUTOR_THREADS = 8
 
     def __init__(self, node_name, buffer_size=1024, connections=10, tcp_ip=None, tcp_port=None):
         """
@@ -71,11 +77,17 @@ class TcpServer(Node):
         self.subscribers_table = {}
         self.ros_services_table = {}
         self.unity_services_table = {}
+        self.unity_actions_table = {}
         self.buffer_size = buffer_size
         self.connections = connections
         self.syscommands = SysCommands(self)
         self.pending_srv_id = None
         self.pending_srv_is_request = False
+        # Set when Unity announces that the next message is action feedback or a
+        # result, mirroring pending_srv_id for services.
+        self.pending_action_id = None
+        self.pending_action_is_result = False
+        self.pending_action_status = 0
         # start() spawns the listen thread before setup_executor() runs, so a
         # client can connect and register a topic while this is still unset.
         # Without the default, that raced into an AttributeError which killed
@@ -173,12 +185,20 @@ class TcpServer(Node):
             MultiThreadedExecutor allows us to set the number of threads
             needed as well as the nodes that need to be spun.
         """
-        num_threads = (
+        # Almost everything registers *after* this runs, because the tables are
+        # filled by sys commands from Unity once it connects. Sizing the pool from
+        # the tables alone therefore yields 1 thread in practice, which deadlocks
+        # actions: execute_callback holds its thread for the whole goal, and the
+        # cancel request for that same goal then has no thread left to run on.
+        # Hence a floor that does not depend on the tables.
+        num_threads = max(
             len(self.publishers_table.keys())
             + len(self.subscribers_table.keys())
             + len(self.ros_services_table.keys())
             + len(self.unity_services_table.keys())
-            + 1
+            + len(self.unity_actions_table.keys()) * 2
+            + 1,
+            self.MIN_EXECUTOR_THREADS,
         )
         executor = MultiThreadedExecutor(num_threads)
 
@@ -191,6 +211,8 @@ class TcpServer(Node):
         for ros_node in self.ros_services_table.values():
             executor.add_node(ros_node)
         for ros_node in self.unity_services_table.values():
+            executor.add_node(ros_node)
+        for ros_node in self.unity_actions_table.values():
             executor.add_node(ros_node)
 
         self.executor = executor
@@ -227,6 +249,8 @@ class TcpServer(Node):
             ros_node.destroy_node()
         for ros_node in self.unity_services_table.values():
             ros_node.destroy_node()
+        for ros_node in self.unity_actions_table.values():
+            ros_node.destroy_node()
 
         self.destroy_node()
 
@@ -246,6 +270,10 @@ class SysCommands:
             "remove_publisher",
             "remove_ros_service",
             "remove_unity_service",
+            "unity_action",
+            "remove_unity_action",
+            "action_feedback",
+            "action_result",
             "response",
             "request",
             "topic_list",
@@ -368,6 +396,54 @@ class SysCommands:
             self.tcp_server.executor.add_node(new_service)
 
         self.tcp_server.loginfo("RegisterUnityService({}, {}) OK".format(topic, message_class))
+
+    def unity_action(self, topic, message_name):
+        """Register a ROS action server whose goals are executed in Unity."""
+        if topic == "":
+            self.tcp_server.send_unity_error(
+                "RegisterUnityAction({}, {}) - Can't register a blank topic name!".format(
+                    topic, message_name
+                )
+            )
+            return
+
+        action_class = self.resolve_message_name(message_name, "action")
+        if action_class is None:
+            self.tcp_server.send_unity_error(
+                "RegisterUnityAction({}, {}) - Unknown action class '{}'".format(
+                    topic, message_name, message_name
+                )
+            )
+            return
+
+        old_node = self.tcp_server.unity_actions_table.get(topic)
+        if old_node is not None:
+            self.tcp_server.unregister_node(old_node)
+
+        new_action = UnityAction(str(topic), action_class, self.tcp_server)
+
+        self.tcp_server.unity_actions_table[topic] = new_action
+        if self.tcp_server.executor is not None:
+            self.tcp_server.executor.add_node(new_action)
+
+        self.tcp_server.loginfo("RegisterUnityAction({}, {}) OK".format(topic, action_class))
+
+    def remove_unity_action(self, topic):
+        self._remove(self.tcp_server.unity_actions_table, topic, "UnityAction")
+
+    def action_feedback(self, action_id):
+        # the next message is a feedback message for this goal
+        self.tcp_server.pending_action_id = action_id
+        self.tcp_server.pending_action_is_result = False
+
+    def action_result(self, action_id, status, has_result):
+        if not has_result:
+            # Unity had nothing to send, so no message follows this command.
+            self.tcp_server.unity_tcp_sender.send_unity_action_result(action_id, None, status)
+            return
+        self.tcp_server.pending_action_id = action_id
+        self.tcp_server.pending_action_is_result = True
+        self.tcp_server.pending_action_status = status
 
     def _remove(self, table, topic, kind):
         """

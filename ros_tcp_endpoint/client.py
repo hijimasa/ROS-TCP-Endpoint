@@ -171,6 +171,42 @@ class ClientThread(threading.Thread):
 
         self.tcp_server.unity_tcp_sender.send_ros_service_response(srv_id, destination, response)
 
+    def handle_action_message(self, destination, data, action_id, is_result, status):
+        """
+        Deliver one action feedback or result message coming back from Unity.
+
+        The action class is looked up from the registration table, since the goal,
+        feedback and result of an action all travel under the same name and are
+        told apart only by the command that preceded them.
+        """
+        action_node = self.tcp_server.unity_actions_table.get(destination)
+        if action_node is None:
+            error_msg = "Received action traffic for unregistered action '{}'!".format(
+                destination
+            )
+            self.tcp_server.send_unity_error(error_msg)
+            self.tcp_server.logerr(error_msg)
+            return
+
+        try:
+            if is_result:
+                message = deserialize_message(data, action_node.action_class.Result())
+                self.tcp_server.unity_tcp_sender.send_unity_action_result(
+                    action_id, message, status
+                )
+            else:
+                message = deserialize_message(data, action_node.action_class.Feedback())
+                self.tcp_server.unity_tcp_sender.send_unity_action_feedback(action_id, message)
+        except Exception as e:  # noqa: BLE001 - a bad payload must not kill the client thread
+            error_msg = "Failed to read action message for '{}': {}: {}".format(
+                destination, type(e).__name__, e
+            )
+            self.tcp_server.send_unity_error(error_msg)
+            self.tcp_server.logerr(error_msg)
+            if is_result:
+                # Nothing usable came back, but the waiting goal must still end.
+                self.tcp_server.unity_tcp_sender.send_unity_action_result(action_id, None, 6)
+
     def run(self):
         """
         Receive a message from Unity and determine where to send it based on the publishers table
@@ -205,6 +241,16 @@ class ClientThread(threading.Thread):
                             self.tcp_server.pending_srv_id, data
                         )
                     self.tcp_server.pending_srv_id = None
+                elif self.tcp_server.pending_action_id is not None:
+                    # Unity announced that this message is feedback or a result for
+                    # a goal it is running.
+                    action_id = self.tcp_server.pending_action_id
+                    is_result = self.tcp_server.pending_action_is_result
+                    status = self.tcp_server.pending_action_status
+                    # Clear before handling: leaving it set after a failure would
+                    # make the next message be read as action traffic too.
+                    self.tcp_server.pending_action_id = None
+                    self.handle_action_message(destination, data, action_id, is_result, status)
                 elif destination == "":
                     # ignore this keepalive message, listen for more
                     pass
