@@ -45,6 +45,11 @@ class UnityTcpSender:
 
         self.sender_id = 1
         self.time_between_halt_checks = 5
+        # How long a ROS service callback waits for Unity to answer before
+        # giving up and returning a default response. Without a limit, a lost
+        # response leaves the callback (and its executor thread) blocked forever
+        # and the rclpy client never gets an answer.
+        self.unity_service_response_timeout = 30.0
         self.tcp_server = tcp_server
 
         # Each sender thread has its own queue: this is always the queue for the currently active thread.
@@ -97,7 +102,12 @@ class UnityTcpSender:
 
     def send_unity_service_request(self, topic, service_class, request):
         if self.queue is None:
-            return None
+            # Returning None from a service callback leaves the caller hanging;
+            # answer with a default response instead.
+            self.tcp_server.logerr(
+                "Unable to call unity service '{}' - no Unity connection!".format(topic)
+            )
+            return service_class.Response()
 
         thread_pauser = ThreadPauser()
         with self.srv_lock:
@@ -113,16 +123,47 @@ class UnityTcpSender:
 
         # rospy starts a new thread for each service request,
         # so it won't break anything if we sleep now while waiting for the response
-        thread_pauser.sleep_until_resumed()
+        resumed = thread_pauser.sleep_until_resumed(timeout=self.unity_service_response_timeout)
+        if not resumed:
+            with self.srv_lock:
+                was_waiting = self.services_waiting.pop(srv_id, None) is not None
+            if was_waiting:
+                # Deregistered before Unity answered: a late response is now
+                # discarded instead of resuming this dead waiter. Give the
+                # caller a default response rather than no response at all.
+                self.tcp_server.logerr(
+                    "Timed out waiting for unity service response on '{}' (srv_id {}) - returning a default response".format(
+                        topic, srv_id
+                    )
+                )
+                return service_class.Response()
+            # The response arrived just as the timeout expired: the client
+            # thread already claimed this waiter, so wait briefly for it to
+            # deliver the result.
+            thread_pauser.sleep_until_resumed(timeout=1.0)
 
-        response = deserialize_message(thread_pauser.result, service_class.Response())
+        try:
+            response = deserialize_message(thread_pauser.result, service_class.Response())
+        except Exception as e:
+            self.tcp_server.logerr(
+                "Failed to deserialize unity service response on '{}': {}".format(topic, e)
+            )
+            return service_class.Response()
         return response
 
     def send_unity_service_response(self, srv_id, data):
-        thread_pauser = None
         with self.srv_lock:
-            thread_pauser = self.services_waiting[srv_id]
-            del self.services_waiting[srv_id]
+            thread_pauser = self.services_waiting.pop(srv_id, None)
+
+        if thread_pauser is None:
+            # A response whose request already timed out (or a duplicate).
+            # A KeyError escaping here would kill the whole client thread.
+            self.tcp_server.logwarn(
+                "Discarding unity service response for unknown srv_id {} (request timed out?)".format(
+                    srv_id
+                )
+            )
+            return
 
         thread_pauser.resume_with_result(data)
 
